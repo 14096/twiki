@@ -2,7 +2,15 @@
 name = "twiki"
 version = "0.2.0"
 edition = "2024"
+rust-version = "1.85"
+description = "A terminal Wikipedia reader"
+license = "MIT"
+readme = "README.md"
 repository = "https://github.com/14096/twiki"
+homepage = "https://github.com/14096/twiki"
+keywords = ["wikipedia", "tui", "terminal", "reader", "cli"]
+categories = ["command-line-utilities"]
+exclude = ["target", "Makefile"]
 
 [dependencies]
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
