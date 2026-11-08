@@ -12,6 +12,7 @@ use ratatui::{
         Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
     },
 };
+use unicode_width::UnicodeWidthStr;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -35,6 +36,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.mode {
         Mode::LangPicker => draw_lang_picker(f, app, t, area),
         Mode::ThemePicker => draw_theme_picker(f, app, t, area),
+        Mode::Toc => draw_toc(f, app, t, area),
         Mode::Help => draw_help(f, t, area),
         _ => {}
     }
@@ -106,14 +108,16 @@ fn draw_search(f: &mut Frame, app: &App, t: &Theme, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let (text_col, cursor) = if focused { (t.text, "_") } else { (t.dim, "") };
+    let text_col = if focused { t.text } else { t.dim };
     f.render_widget(
-        Paragraph::new(Span::styled(
-            format!("{}{}", app.search_input, cursor),
-            s(text_col),
-        )),
+        Paragraph::new(Span::styled(app.search_input.as_str(), s(text_col))),
         inner,
     );
+    if focused {
+        let before: String = app.search_input.chars().take(app.search_cursor).collect();
+        let x = inner.x + before.width() as u16;
+        f.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y));
+    }
 }
 
 fn draw_article(f: &mut Frame, app: &mut App, t: &Theme, area: Rect) {
@@ -180,9 +184,40 @@ fn draw_article(f: &mut Frame, app: &mut App, t: &Theme, area: Rect) {
 
     let article = app.article.as_ref().unwrap();
     let selected_link = app.selected_link;
+    let col_width = text_area.width.max(1);
 
-    let ratatui_lines: Vec<Line> = article
-        .lines
+    if app.layout_dirty || app.layout_width != col_width {
+        let mut offsets = Vec::with_capacity(article.lines.len());
+        let mut total = 0usize;
+        for wiki_line in &article.lines {
+            offsets.push(total);
+            let line = Line::from(
+                wiki_line
+                    .iter()
+                    .map(|ws| Span::raw(ws.text.as_str()))
+                    .collect::<Vec<_>>(),
+            );
+            total += Paragraph::new(line)
+                .wrap(Wrap { trim: false })
+                .line_count(col_width)
+                .max(1);
+        }
+        app.line_offsets = offsets;
+        app.total_lines = total;
+        app.layout_width = col_width;
+        app.layout_dirty = false;
+        app.clamp_scroll();
+    }
+
+    let article = app.article.as_ref().unwrap();
+    let offsets = &app.line_offsets;
+    let first = offsets
+        .partition_point(|&o| o <= app.scroll)
+        .saturating_sub(1);
+    let end = offsets.partition_point(|&o| o < app.scroll + app.viewport_height);
+    let skip_rows = app.scroll - offsets.get(first).copied().unwrap_or(0);
+
+    let visible: Vec<Line> = article.lines[first.min(article.lines.len())..end.max(first)]
         .iter()
         .map(|wiki_line| {
             Line::from(
@@ -194,20 +229,9 @@ fn draw_article(f: &mut Frame, app: &mut App, t: &Theme, area: Rect) {
         })
         .collect();
 
-    let col_width = text_area.width.max(1) as usize;
-    let visual_lines: usize = article
-        .lines
-        .iter()
-        .map(|wiki_line| {
-            let char_len: usize = wiki_line.iter().map(|s| s.text.chars().count()).sum();
-            (char_len / col_width + 1).max(1)
-        })
-        .sum();
-    app.total_lines = visual_lines;
-
     f.render_widget(
-        Paragraph::new(Text::from(ratatui_lines))
-            .scroll((app.scroll.min(u16::MAX as usize) as u16, 0))
+        Paragraph::new(Text::from(visible))
+            .scroll((skip_rows.min(u16::MAX as usize) as u16, 0))
             .wrap(Wrap { trim: false }),
         text_area,
     );
@@ -229,7 +253,7 @@ fn wiki_span_to_ratatui<'a>(ws: &'a WikiSpan, selected_link: Option<usize>, t: &
     if let Some(link_idx) = ws.link_index {
         return if selected_link == Some(link_idx) {
             Span::styled(
-                ws.text.clone(),
+                ws.text.as_str(),
                 Style::default()
                     .fg(t.link_hi_fg)
                     .bg(t.link_hi_bg)
@@ -237,7 +261,7 @@ fn wiki_span_to_ratatui<'a>(ws: &'a WikiSpan, selected_link: Option<usize>, t: &
             )
         } else {
             Span::styled(
-                ws.text.clone(),
+                ws.text.as_str(),
                 Style::default()
                     .fg(t.link)
                     .add_modifier(Modifier::UNDERLINED),
@@ -255,11 +279,16 @@ fn wiki_span_to_ratatui<'a>(ws: &'a WikiSpan, selected_link: Option<usize>, t: &
         SpanKind::CodeBlock => Style::default().fg(t.code).bg(t.code_bg),
         SpanKind::Normal => s(t.text),
     };
-    Span::styled(ws.text.clone(), style)
+    Span::styled(ws.text.as_str(), style)
 }
 
 fn draw_statusbar(f: &mut Frame, app: &App, t: &Theme, area: Rect) {
-    let line: Line = if let Some(status) = &app.status {
+    let line: Line = if app.mode == Mode::Find {
+        Line::from(vec![
+            Span::styled(" find: ", sb(t.accent)),
+            Span::styled(format!("{}_", app.find_input), s(t.text)),
+        ])
+    } else if let Some(status) = &app.status {
         let col = if status.starts_with("Error") {
             t.err
         } else {
@@ -269,7 +298,9 @@ fn draw_statusbar(f: &mut Frame, app: &App, t: &Theme, area: Rect) {
     } else {
         let hint = match app.mode {
             Mode::Help => " Esc  close",
-            Mode::LangPicker | Mode::ThemePicker => " j/k  move   Enter  select   Esc  cancel",
+            Mode::LangPicker | Mode::ThemePicker | Mode::Toc => {
+                " j/k  move   Enter  select   Esc  cancel"
+            }
             _ => " ?  help   q  quit",
         };
         Line::from(Span::styled(hint, s(t.dim)))
@@ -281,8 +312,16 @@ fn draw_statusbar(f: &mut Frame, app: &App, t: &Theme, area: Rect) {
     );
 }
 
-fn draw_lang_picker(f: &mut Frame, app: &App, t: &Theme, area: Rect) {
-    let popup = centered_popup(area, 36, LANGUAGES.len() as u16 + 4);
+fn draw_picker(
+    f: &mut Frame,
+    t: &Theme,
+    area: Rect,
+    title: &str,
+    width: u16,
+    items: Vec<ListItem>,
+    cursor: usize,
+) {
+    let popup = centered_popup(area, width, items.len() as u16 + 4);
     render_popup_bg(f, popup);
 
     let block = Block::default()
@@ -290,32 +329,12 @@ fn draw_lang_picker(f: &mut Frame, app: &App, t: &Theme, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(s(t.accent))
         .bg(t.surface)
-        .title(Span::styled(" Language ", sb(t.title)))
+        .title(Span::styled(format!(" {title} "), sb(t.title)))
         .title_alignment(Alignment::Center)
         .padding(Padding::horizontal(1));
 
-    let items: Vec<ListItem> = LANGUAGES
-        .iter()
-        .enumerate()
-        .map(|(i, lang)| {
-            let marker = if i == app.lang_index { "●" } else { " " };
-            let label = format!("{marker} {:<5} {}", lang.code, lang.name);
-            let style = if i == app.lang_cursor {
-                Style::default()
-                    .fg(t.key_fg)
-                    .bg(t.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else if i == app.lang_index {
-                sb(t.accent)
-            } else {
-                s(t.text)
-            };
-            ListItem::new(Span::styled(label, style))
-        })
-        .collect();
-
     let mut state = ListState::default();
-    state.select(Some(app.lang_cursor));
+    state.select(Some(cursor));
 
     f.render_stateful_widget(
         List::new(items).block(block).highlight_style(
@@ -329,54 +348,66 @@ fn draw_lang_picker(f: &mut Frame, app: &App, t: &Theme, area: Rect) {
     );
 }
 
+fn item_style(t: &Theme, is_cursor: bool, is_current: bool) -> Style {
+    if is_cursor {
+        Style::default()
+            .fg(t.key_fg)
+            .bg(t.accent)
+            .add_modifier(Modifier::BOLD)
+    } else if is_current {
+        sb(t.accent)
+    } else {
+        s(t.text)
+    }
+}
+
+fn draw_lang_picker(f: &mut Frame, app: &App, t: &Theme, area: Rect) {
+    let items: Vec<ListItem> = LANGUAGES
+        .iter()
+        .enumerate()
+        .map(|(i, lang)| {
+            let marker = if i == app.lang_index { "●" } else { " " };
+            let label = format!("{marker} {:<5} {}", lang.code, lang.name);
+            ListItem::new(Span::styled(
+                label,
+                item_style(t, i == app.lang_cursor, i == app.lang_index),
+            ))
+        })
+        .collect();
+    draw_picker(f, t, area, "Language", 36, items, app.lang_cursor);
+}
+
 fn draw_theme_picker(f: &mut Frame, app: &App, t: &Theme, area: Rect) {
-    let popup = centered_popup(area, 40, THEMES.len() as u16 + 4);
-    render_popup_bg(f, popup);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(s(t.accent))
-        .bg(t.surface)
-        .title(Span::styled(" Theme ", sb(t.title)))
-        .title_alignment(Alignment::Center)
-        .padding(Padding::horizontal(1));
-
     let items: Vec<ListItem> = THEMES
         .iter()
         .enumerate()
         .map(|(i, theme)| {
             let marker = if i == app.theme_index { "●" } else { " " };
             let label = format!("{marker} {}", theme.name);
-            let style = if i == app.theme_cursor {
-                Style::default()
-                    .fg(t.key_fg)
-                    .bg(t.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else if i == app.theme_index {
-                sb(t.accent)
-            } else {
-                s(t.text)
-            };
-
-            let dot = Span::styled("  ", Style::default().fg(theme.accent));
+            let style = item_style(t, i == app.theme_cursor, i == app.theme_index);
+            let dot = Span::styled("  ", Style::default().fg(theme.accent));
             ListItem::new(Line::from(vec![Span::styled(label, style), dot]))
         })
         .collect();
+    draw_picker(f, t, area, "Theme", 40, items, app.theme_cursor);
+}
 
-    let mut state = ListState::default();
-    state.select(Some(app.theme_cursor));
-
-    f.render_stateful_widget(
-        List::new(items).block(block).highlight_style(
-            Style::default()
-                .fg(t.key_fg)
-                .bg(t.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        popup,
-        &mut state,
-    );
+fn draw_toc(f: &mut Frame, app: &App, t: &Theme, area: Rect) {
+    let Some(article) = &app.article else { return };
+    let items: Vec<ListItem> = article
+        .headings
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let indent = "  ".repeat(h.level.saturating_sub(1) as usize);
+            ListItem::new(Span::styled(
+                format!("{indent}{}", h.title),
+                item_style(t, i == app.toc_cursor, false),
+            ))
+        })
+        .collect();
+    let width = (area.width * 2 / 3).clamp(30, 70);
+    draw_picker(f, t, area, "Contents", width, items, app.toc_cursor);
 }
 
 fn draw_help(f: &mut Frame, t: &Theme, area: Rect) {
@@ -385,7 +416,10 @@ fn draw_help(f: &mut Frame, t: &Theme, area: Rect) {
             "Search",
             &[
                 ("Enter", "fetch article"),
-                ("Backspace", "delete character"),
+                ("Left / Right", "move cursor"),
+                ("Ctrl-A / Ctrl-E", "start / end of line"),
+                ("Ctrl-U", "clear to start"),
+                ("F1", "help"),
                 ("Ctrl-L", "open language picker"),
                 ("Ctrl-T", "open theme picker"),
                 ("Esc", "back to article"),
@@ -398,6 +432,7 @@ fn draw_help(f: &mut Frame, t: &Theme, area: Rect) {
                 ("j / k", "scroll one line down / up"),
                 ("Space / PgDn", "scroll one page down"),
                 ("PgUp", "scroll one page up"),
+                ("Mouse wheel", "scroll"),
                 ("Ctrl-D", "scroll half page down"),
                 ("Ctrl-U", "scroll half page up"),
                 ("g", "jump to top"),
@@ -405,6 +440,10 @@ fn draw_help(f: &mut Frame, t: &Theme, area: Rect) {
                 ("Tab", "select next link"),
                 ("Shift-Tab", "select previous link"),
                 ("Enter", "follow selected link"),
+                ("Backspace / h", "go back"),
+                ("f", "find in article"),
+                ("n / N", "next / previous match"),
+                ("o", "table of contents"),
                 ("L", "open language picker"),
                 ("T", "open theme picker"),
                 ("q", "quit"),
@@ -422,7 +461,7 @@ fn draw_help(f: &mut Frame, t: &Theme, area: Rect) {
 
     let content_height: u16 = sections.iter().map(|(_, rows)| rows.len() as u16 + 2).sum();
     let popup_height = (content_height + 2).min(area.height.saturating_sub(2));
-    let popup_width: u16 = 52;
+    let popup_width: u16 = 56;
     let popup = centered_popup(area, popup_width, popup_height);
     render_popup_bg(f, popup);
 
@@ -446,7 +485,7 @@ fn draw_help(f: &mut Frame, t: &Theme, area: Rect) {
         lines.push(Line::from(Span::styled(*section, sb(t.accent))));
         for (key, desc) in *rows {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {key:<18}", key = key), sb(t.key_bg)),
+                Span::styled(format!("  {key:<18}"), sb(t.key_bg)),
                 Span::styled(*desc, s(t.text)),
             ]));
         }

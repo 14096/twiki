@@ -1,13 +1,17 @@
+use scraper::{ElementRef, Html, Selector, node::Node};
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::rc::Rc;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Article {
     pub title: String,
     pub lines: Vec<Vec<Span>>,
     pub links: Vec<Link>,
+    pub headings: Vec<Heading>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpanKind {
     Normal,
     H1,
@@ -29,12 +33,20 @@ pub struct Span {
 #[derive(Debug, Clone)]
 pub struct Link {
     pub title: String,
+    /// Every logical line on which this link appears (ascending).
+    pub lines: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Heading {
+    pub title: String,
+    pub level: u8,
     pub line: usize,
 }
 
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
-    query: SearchQuery,
+    query: Option<SearchQuery>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,72 +61,106 @@ struct SearchResult {
 
 #[derive(Debug, Deserialize)]
 struct ParseResponse {
-    parse: ParseResult,
+    parse: Option<ParseResult>,
+    error: Option<ApiError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiError {
+    code: String,
+    info: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct ParseResult {
     title: String,
-    text: TextContent,
+    text: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct TextContent {
-    #[serde(rename = "*")]
-    content: String,
+pub fn build_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(concat!(
+            "twiki/",
+            env!("CARGO_PKG_VERSION"),
+            " (",
+            env!("CARGO_PKG_REPOSITORY"),
+            ")"
+        ))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
 }
 
-pub async fn fetch_article(query: &str, lang: &str) -> anyhow::Result<Article> {
-    let client = reqwest::Client::builder()
-        .user_agent("twiki/0.1 (https://github.com/user/twiki)")
-        .build()?;
+async fn fetch_parse(
+    client: &reqwest::Client,
+    base: &str,
+    page: &str,
+) -> anyhow::Result<Option<Article>> {
+    let url = format!(
+        "{base}?action=parse&page={}&prop=text&format=json&formatversion=2&redirects=1&disablelimitreport=1",
+        urlencoding::encode(page)
+    );
+    let resp: ParseResponse = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    if let Some(parsed) = resp.parse {
+        let html = parsed.text;
+        let title = parsed.title;
+        let article = tokio::task::spawn_blocking(move || parse_html(&title, &html)).await?;
+        return Ok(Some(article));
+    }
+    match resp.error {
+        Some(e) if matches!(e.code.as_str(), "missingtitle" | "invalidtitle") => Ok(None),
+        Some(e) => anyhow::bail!("{}", e.info),
+        None => Ok(None),
+    }
+}
 
-    let base = format!("https://{}.wikipedia.org/w/api.php", lang);
+/// Tries the query as an exact title first, then falls back to full-text search.
+pub async fn fetch_article(
+    client: &reqwest::Client,
+    query: &str,
+    lang: &str,
+) -> anyhow::Result<Article> {
+    let base = format!("https://{lang}.wikipedia.org/w/api.php");
+
+    if let Some(article) = fetch_parse(client, &base, query).await? {
+        return Ok(article);
+    }
 
     let search_url = format!(
         "{base}?action=query&list=search&srsearch={}&format=json&srlimit=1",
         urlencoding::encode(query)
     );
-    let resp: SearchResponse = client.get(&search_url).send().await?.json().await?;
+    let resp: SearchResponse = client
+        .get(&search_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
     let title = resp
         .query
-        .search
-        .into_iter()
-        .next()
+        .and_then(|q| q.search.into_iter().next())
         .map(|r| r.title)
-        .unwrap_or_else(|| query.to_string());
+        .ok_or_else(|| anyhow::anyhow!("No article found for \"{query}\""))?;
 
-    let parse_url = format!(
-        "{base}?action=parse&page={}&prop=text&format=json&disablelimitreport=1",
-        urlencoding::encode(&title)
-    );
-    let parsed: ParseResponse = client.get(&parse_url).send().await?.json().await?;
-
-    let article = parse_html(&parsed.parse.title, &parsed.parse.text.content);
-    Ok(article)
+    fetch_parse(client, &base, &title)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Article not found: \"{title}\""))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct TextCtx {
-    link: Option<String>,
+    link: Option<Rc<str>>,
     heading: u8,
     bold: bool,
     italic: bool,
     code: bool,
     in_pre: bool,
-}
-
-impl Default for TextCtx {
-    fn default() -> Self {
-        Self {
-            link: None,
-            heading: 0,
-            bold: false,
-            italic: false,
-            code: false,
-            in_pre: false,
-        }
-    }
 }
 
 impl TextCtx {
@@ -128,235 +174,326 @@ impl TextCtx {
         match self.heading {
             1 => SpanKind::H1,
             2 | 3 => SpanKind::H2,
-            4 | 5 | 6 => SpanKind::H3,
-            _ => {
-                if self.bold {
-                    SpanKind::Bold
-                } else if self.italic {
-                    SpanKind::Italic
-                } else {
-                    SpanKind::Normal
-                }
-            }
+            4..=6 => SpanKind::H3,
+            _ if self.bold => SpanKind::Bold,
+            _ if self.italic => SpanKind::Italic,
+            _ => SpanKind::Normal,
         }
     }
 }
 
-enum Token {
-    Text { text: String, ctx: TextCtx },
-    Newline,
+#[derive(Default)]
+struct Builder {
+    lines: Vec<Vec<Span>>,
+    links: Vec<Link>,
+    link_map: HashMap<Rc<str>, usize>,
+    current: Vec<Span>,
+    blank_run: usize,
 }
 
-fn parse_html(title: &str, html: &str) -> Article {
-    use scraper::{ElementRef, Html, Selector};
-
-    let document = Html::parse_fragment(html);
-    let mut tokens: Vec<Token> = Vec::new();
-
-    let skip_sel = Selector::parse(
-        "table, figure, figcaption, \
-         .infobox, .navbox, .sidebar, .reflist, \
-         .references, sup.reference, .mw-editsection, \
-         .thumb, .gallery, .hatnote, style, script",
-    )
-    .unwrap();
-
-    let stop_sel = Selector::parse("#Notes, #References, #Book_sources, #External_links").unwrap();
-
-    fn walk_el(
-        el: ElementRef,
-        tokens: &mut Vec<Token>,
-        skip_sel: &Selector,
-        stop_sel: &Selector,
-        ctx: &TextCtx,
-    ) -> bool {
-        let tag = el.value().name();
-
-        if skip_sel.matches_with_scope(&el, None) {
-            return false;
-        }
-
-        if stop_sel.matches_with_scope(&el, None) {
-            return true;
-        }
-
-        let heading_level: u8 = match tag {
-            "h1" => 1,
-            "h2" => 2,
-            "h3" => 3,
-            "h4" => 4,
-            "h5" => 5,
-            "h6" => 6,
-            _ => 0,
-        };
-
-        let is_block = heading_level > 0
-            || matches!(tag, "p" | "li" | "div" | "blockquote" | "pre" | "dd" | "dt");
-
-        if is_block {
-            tokens.push(Token::Newline);
-        } else if tag == "br" {
-            tokens.push(Token::Newline);
-            return false;
-        }
-
-        let child_ctx = TextCtx {
-            link: if tag == "a" {
-                let href = el.value().attr("href").unwrap_or("");
-                if href.starts_with("/wiki/") && !href.contains(':') {
-                    let page = href.trim_start_matches("/wiki/").replace('_', " ");
-                    Some(percent_decode(&page))
-                } else {
-                    ctx.link.clone()
-                }
-            } else {
-                ctx.link.clone()
-            },
-            heading: if heading_level > 0 {
-                heading_level
-            } else {
-                ctx.heading
-            },
-            bold: ctx.bold || matches!(tag, "b" | "strong"),
-            italic: ctx.italic || matches!(tag, "i" | "em"),
-            code: ctx.code || matches!(tag, "code" | "tt" | "kbd" | "samp"),
-            in_pre: ctx.in_pre || tag == "pre",
-        };
-
-        for child in el.children() {
-            use scraper::node::Node;
-            match child.value() {
-                Node::Text(t) => {
-                    let text: &str = t.as_ref();
-                    if child_ctx.in_pre || !text.trim().is_empty() {
-                        tokens.push(Token::Text {
-                            text: text.to_string(),
-                            ctx: child_ctx.clone(),
-                        });
-                    }
-                }
-                Node::Element(_) => {
-                    if let Some(child_el) = ElementRef::wrap(child) {
-                        if walk_el(child_el, tokens, skip_sel, stop_sel, &child_ctx) {
-                            return true;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if is_block {
-            tokens.push(Token::Newline);
-        }
-        false
-    }
-
-    let root = document.root_element();
-    walk_el(root, &mut tokens, &skip_sel, &stop_sel, &TextCtx::default());
-
-    let mut lines: Vec<Vec<Span>> = Vec::new();
-    let mut links: Vec<Link> = Vec::new();
-    let mut current_line: Vec<Span> = Vec::new();
-
-    let flush = |lines: &mut Vec<Vec<Span>>, line: &mut Vec<Span>| {
-        if line.is_empty() {
-            lines.push(vec![Span {
-                text: String::new(),
-                link_index: None,
-                kind: SpanKind::Normal,
-            }]);
-        } else {
-            lines.push(std::mem::take(line));
-        }
-    };
-
-    for token in tokens {
-        match token {
-            Token::Newline => {
-                flush(&mut lines, &mut current_line);
-            }
-            Token::Text { text, ctx } => {
-                for (i, part) in text.split('\n').enumerate() {
-                    if i > 0 {
-                        flush(&mut lines, &mut current_line);
-                    }
-                    if part.is_empty() && !ctx.in_pre {
-                        continue;
-                    }
-                    let kind = ctx.kind();
-                    let link_index = if let Some(ref lt) = ctx.link {
-                        let line_no = lines.len();
-                        let idx = links.iter().position(|l| &l.title == lt);
-                        Some(idx.unwrap_or_else(|| {
-                            links.push(Link {
-                                title: lt.clone(),
-                                line: line_no,
-                            });
-                            links.len() - 1
-                        }))
-                    } else {
-                        None
-                    };
-                    current_line.push(Span {
-                        text: part.to_string(),
-                        link_index,
-                        kind,
-                    });
-                }
-            }
-        }
-    }
-    if !current_line.is_empty() {
-        lines.push(current_line);
-    }
-
-    let mut collapsed: Vec<Vec<Span>> = Vec::with_capacity(lines.len());
-    let mut blank_run = 0usize;
-    for line in lines {
+impl Builder {
+    fn push_line(&mut self, line: Vec<Span>) {
         let is_blank = line.iter().all(|s| s.text.trim().is_empty());
         let is_code = line.iter().any(|s| s.kind == SpanKind::CodeBlock);
         if is_blank && !is_code {
-            blank_run += 1;
-            if blank_run <= 1 {
-                collapsed.push(line);
+            self.blank_run += 1;
+            if self.lines.is_empty() || self.blank_run > 1 {
+                return;
             }
         } else {
-            blank_run = 0;
-            collapsed.push(line);
+            self.blank_run = 0;
         }
+        self.lines.push(line);
     }
 
-    Article {
-        title: title.to_string(),
-        lines: collapsed,
-        links,
+    fn newline(&mut self) {
+        let line = if self.current.is_empty() {
+            vec![Span {
+                text: String::new(),
+                link_index: None,
+                kind: SpanKind::Normal,
+            }]
+        } else {
+            std::mem::take(&mut self.current)
+        };
+        self.push_line(line);
     }
-}
 
-fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
-                out.push(char::from(h * 16 + l));
-                i += 3;
+    fn text(&mut self, text: &str, ctx: &TextCtx) {
+        for (i, part) in text.split('\n').enumerate() {
+            if i > 0 {
+                self.newline();
+            }
+            if part.is_empty() && !ctx.in_pre {
                 continue;
             }
+            let link_index = ctx.link.as_ref().map(|title| {
+                let line_no = self.lines.len();
+                let idx = *self.link_map.entry(title.clone()).or_insert_with(|| {
+                    self.links.push(Link {
+                        title: title.to_string(),
+                        lines: Vec::new(),
+                    });
+                    self.links.len() - 1
+                });
+                let lines = &mut self.links[idx].lines;
+                if lines.last() != Some(&line_no) {
+                    lines.push(line_no);
+                }
+                idx
+            });
+            self.current.push(Span {
+                text: part.to_string(),
+                link_index,
+                kind: ctx.kind(),
+            });
         }
-        out.push(char::from(bytes[i]));
-        i += 1;
     }
-    out
+
+    fn finish(mut self, title: &str) -> Article {
+        if !self.current.is_empty() {
+            let line = std::mem::take(&mut self.current);
+            self.push_line(line);
+        }
+        let headings = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter_map(|(line, spans)| {
+                let level = match spans.iter().find(|s| !s.text.trim().is_empty())?.kind {
+                    SpanKind::H1 => 1,
+                    SpanKind::H2 => 2,
+                    SpanKind::H3 => 3,
+                    _ => return None,
+                };
+                let all_heading = spans.iter().all(|s| {
+                    s.text.trim().is_empty()
+                        || matches!(s.kind, SpanKind::H1 | SpanKind::H2 | SpanKind::H3)
+                });
+                if !all_heading {
+                    return None;
+                }
+                let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+                Some(Heading {
+                    title: text.trim().to_string(),
+                    level,
+                    line,
+                })
+            })
+            .collect();
+        Article {
+            title: title.to_string(),
+            lines: self.lines,
+            links: self.links,
+            headings,
+        }
+    }
 }
 
-fn from_hex(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
+struct Selectors {
+    skip: Selector,
+    stop: Selector,
+}
+
+fn walk_el(el: ElementRef, b: &mut Builder, sels: &Selectors, ctx: &TextCtx) -> bool {
+    let tag = el.value().name();
+
+    if sels.skip.matches_with_scope(&el, None) {
+        return false;
+    }
+    if sels.stop.matches_with_scope(&el, None) {
+        return true;
+    }
+
+    let heading_level: u8 = match tag {
+        "h1" => 1,
+        "h2" => 2,
+        "h3" => 3,
+        "h4" => 4,
+        "h5" => 5,
+        "h6" => 6,
+        _ => 0,
+    };
+
+    let is_block =
+        heading_level > 0 || matches!(tag, "p" | "li" | "div" | "blockquote" | "pre" | "dd" | "dt");
+
+    if tag == "br" {
+        b.newline();
+        return false;
+    }
+    if is_block {
+        b.newline();
+    }
+
+    let link = if tag == "a" {
+        let href = el.value().attr("href").unwrap_or("");
+        match href.strip_prefix("/wiki/") {
+            Some(rest) if !rest.contains(':') => {
+                let page = rest.split('#').next().unwrap_or(rest);
+                let page = decode_title(page);
+                if page.is_empty() {
+                    ctx.link.clone()
+                } else {
+                    Some(Rc::from(page))
+                }
+            }
+            _ => ctx.link.clone(),
+        }
+    } else {
+        ctx.link.clone()
+    };
+
+    let child_ctx = TextCtx {
+        link,
+        heading: if heading_level > 0 {
+            heading_level
+        } else {
+            ctx.heading
+        },
+        bold: ctx.bold || matches!(tag, "b" | "strong"),
+        italic: ctx.italic || matches!(tag, "i" | "em"),
+        code: ctx.code || matches!(tag, "code" | "tt" | "kbd" | "samp"),
+        in_pre: ctx.in_pre || tag == "pre",
+    };
+
+    if tag == "li" {
+        let depth = el
+            .ancestors()
+            .filter_map(ElementRef::wrap)
+            .filter(|a| a.value().name() == "li")
+            .count();
+        let ordered = el
+            .parent()
+            .and_then(ElementRef::wrap)
+            .is_some_and(|p| p.value().name() == "ol");
+        let marker = if ordered {
+            let n = el
+                .prev_siblings()
+                .filter_map(ElementRef::wrap)
+                .filter(|s| s.value().name() == "li")
+                .count()
+                + 1;
+            format!("{n}. ")
+        } else {
+            "• ".to_string()
+        };
+        let plain = TextCtx {
+            link: None,
+            ..child_ctx.clone()
+        };
+        b.text(&format!("{}{marker}", "  ".repeat(depth)), &plain);
+    }
+
+    for child in el.children() {
+        match child.value() {
+            Node::Text(t) => {
+                let text: &str = t.as_ref();
+                if child_ctx.in_pre || !text.trim().is_empty() {
+                    b.text(text, &child_ctx);
+                }
+            }
+            Node::Element(_) => {
+                if let Some(child_el) = ElementRef::wrap(child)
+                    && walk_el(child_el, b, sels, &child_ctx)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if is_block {
+        b.newline();
+    }
+    false
+}
+
+pub fn parse_html(title: &str, html: &str) -> Article {
+    let document = Html::parse_fragment(html);
+    let sels = Selectors {
+        skip: Selector::parse(
+            "table, figure, figcaption, \
+             .infobox, .navbox, .sidebar, .reflist, \
+             .references, sup.reference, .mw-editsection, \
+             .thumb, .gallery, .hatnote, .shortdescription, style, script",
+        )
+        .unwrap(),
+        stop: Selector::parse("#Notes, #References, #Book_sources, #External_links").unwrap(),
+    };
+
+    let mut b = Builder::default();
+    walk_el(document.root_element(), &mut b, &sels, &TextCtx::default());
+    b.finish(title)
+}
+
+fn decode_title(s: &str) -> String {
+    let decoded = urlencoding::decode(s)
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| s.to_string());
+    decoded.replace('_', " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_utf8_titles() {
+        assert_eq!(decode_title("Caf%C3%A9_au_lait"), "Café au lait");
+        assert_eq!(decode_title("A_%26_B%21"), "A & B!");
+    }
+
+    #[test]
+    fn collects_links_and_dedupes() {
+        let a = parse_html(
+            "T",
+            r#"<p><a href="/wiki/Rust_(language)">Rust</a> and <a href="/wiki/Rust_(language)#History">again</a></p>"#,
+        );
+        assert_eq!(a.links.len(), 1);
+        assert_eq!(a.links[0].title, "Rust (language)");
+    }
+
+    #[test]
+    fn ignores_special_links() {
+        let a = parse_html("T", r#"<p><a href="/wiki/File:X.png">x</a></p>"#);
+        assert!(a.links.is_empty());
+    }
+
+    #[test]
+    fn link_lines_match_collapsed_lines() {
+        let a = parse_html(
+            "T",
+            r#"<p>one</p><p></p><p></p><p></p><p><a href="/wiki/B">b</a></p>"#,
+        );
+        let line = a.links[0].lines[0];
+        assert!(a.lines[line].iter().any(|s| s.link_index == Some(0)));
+    }
+
+    #[test]
+    fn extracts_headings_and_lists() {
+        let a = parse_html(
+            "T",
+            "<h2>Intro</h2><ul><li>x</li></ul><ol><li>a</li><li>b</li></ol>",
+        );
+        assert_eq!(a.headings.len(), 1);
+        assert_eq!(a.headings[0].title, "Intro");
+        let text: Vec<String> = a
+            .lines
+            .iter()
+            .map(|l| l.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        assert!(text.contains(&"• x".to_string()));
+        assert!(text.contains(&"2. b".to_string()));
+    }
+
+    #[test]
+    fn stops_at_references() {
+        let a = parse_html(
+            "T",
+            r#"<p>keep</p><h2 id="References">Refs</h2><p>drop</p>"#,
+        );
+        assert!(a.lines.iter().flatten().all(|s| s.text != "drop"));
     }
 }
